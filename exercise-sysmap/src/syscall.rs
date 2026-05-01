@@ -358,15 +358,161 @@ fn sys_brk(addr: usize) -> isize {
     addr as isize
 }
 
+/// Base address for anonymous mmap allocations, growing downward from
+/// the top of the user address space to avoid conflicts with code/stack.
+static MMAP_BASE: AtomicUsize = AtomicUsize::new(0x3_0000_0000);
+
 fn sys_mmap(
-    _addr: *mut c_void,
-    _length: usize,
-    _prot: i32,
-    _flags: i32,
-    _fd: i32,
-    _offset: isize,
+    addr: *mut c_void,
+    length: usize,
+    prot: i32,
+    flags: i32,
+    fd: i32,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let prot = MmapProt::from_bits(prot).unwrap_or(MmapProt::empty());
+    let flags = MmapFlags::from_bits(flags).unwrap_or(MmapFlags::empty());
+
+    if addr.is_null() && flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        // Anonymous mapping: allocate virtual memory in user space
+        let page_size = axhal::paging::PAGE_SIZE_4K;
+        let map_len = (length + page_size - 1) & !(page_size - 1);
+        let num_pages = map_len / page_size;
+
+        let Some(vaddr_base) = allocate_vaddr(num_pages) else {
+            return neg_errno(LinuxError::ENOMEM);
+        };
+
+        let uflags: MappingFlags = prot.into();
+        let mut aspace_guard = crate::USER_ASPACE.lock();
+        let Some(ref uspace_arc) = *aspace_guard else {
+            return neg_errno(LinuxError::ENOMEM);
+        };
+        let mut uspace = uspace_arc.lock();
+
+        // Map each page
+        for i in 0..num_pages {
+            let vaddr = vaddr_base + i * page_size;
+            if uspace
+                .map_alloc(
+                    vaddr.into(),
+                    page_size,
+                    uflags,
+                    true,
+                )
+                .is_err()
+            {
+                return neg_errno(LinuxError::ENOMEM);
+            }
+        }
+
+        return vaddr_base as isize;
+    }
+
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        // File-backed mapping: allocate VM, read file content, copy into pages
+        let page_size = axhal::paging::PAGE_SIZE_4K;
+        let map_len = (length + page_size - 1) & !(page_size - 1);
+        let num_pages = map_len / page_size;
+
+        // Choose address: use hint if provided and MAP_FIXED is set, else allocate
+        let vaddr_base = if !addr.is_null() && flags.contains(MmapFlags::MAP_FIXED) {
+            addr as usize
+        } else {
+            match allocate_vaddr(num_pages) {
+                Some(v) => v,
+                None => return neg_errno(LinuxError::ENOMEM),
+            }
+        };
+
+        let uflags: MappingFlags = prot.into();
+        let mut aspace_guard = crate::USER_ASPACE.lock();
+        let Some(ref uspace_arc) = *aspace_guard else {
+            return neg_errno(LinuxError::ENOMEM);
+        };
+        let mut uspace = uspace_arc.lock();
+
+        // Map each page
+        for i in 0..num_pages {
+            let vaddr = vaddr_base + i * page_size;
+            if uspace
+                .map_alloc(
+                    vaddr.into(),
+                    page_size,
+                    uflags,
+                    true,
+                )
+                .is_err()
+            {
+                return neg_errno(LinuxError::ENOMEM);
+            }
+        }
+
+        // Read file content and copy into mapped pages
+        let file_offset = offset as u64;
+        let read_len = length.min(map_len);
+
+        let buf = match read_file_at(fd, file_offset, read_len) {
+            Ok(b) => b,
+            Err(e) => return neg_errno(e),
+        };
+
+        // Copy data into user pages
+        let _ = uspace.write((vaddr_base as usize).into(), &buf);
+
+        return vaddr_base as isize;
+    }
+
+    // Unsupported: non-null addr hint for anonymous maps
+    neg_errno(LinuxError::EINVAL)
+}
+
+/// Allocate `num_pages` consecutive virtual addresses, growing downward from
+/// the top of the user address space. Returns the base address.
+fn allocate_vaddr(num_pages: usize) -> Option<usize> {
+    let page_size = axhal::paging::PAGE_SIZE_4K;
+    let total_size = num_pages * page_size;
+
+    let mut current = MMAP_BASE.load(Ordering::SeqCst);
+    let new_base = current.checked_sub(total_size)?;
+
+    // Ensure we don't collide with the user stack (grows down from end of space)
+    // and don't go below a reasonable minimum.
+    if new_base < 0x1000 {
+        return None;
+    }
+
+    MMAP_BASE.store(new_base, Ordering::SeqCst);
+    Some(new_base)
+}
+
+/// Read file content from an open fd at the given offset.
+fn read_file_at(fd: i32, offset: u64, max_len: usize) -> Result<Vec<u8>, LinuxError> {
+    use axfs::fops::File;
+
+    let mut buf = Vec::with_capacity(max_len);
+    let mut chunk_buf = [0u8; 4096];
+
+    with_file_fd(fd, |file| {
+        let mut to_read = max_len;
+        let mut off = offset;
+
+        while to_read > 0 {
+            let chunk_size = to_read.min(chunk_buf.len());
+            match file.read_at(off, &mut chunk_buf[..chunk_size]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk_buf[..n]);
+                    to_read -= n;
+                    off += n as u64;
+                }
+                Err(e) => return Err(LinuxError::from(e)),
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(buf)
 }
 
 #[cfg(target_arch = "x86_64")]
